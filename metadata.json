@@ -1,0 +1,6 @@
+{
+  "name": "Kotoba Infinity - Hệ sinh thái JLPT & Tiếng Nhật Toàn diện",
+  "description": "Nền tảng luyện thi JLPT N5-N1 và chinh phục tiếng Nhật thực chiến với 101 chuyên mục chuyên sâu, 8 phân hệ chuẩn hóa (PH1-PH8), 10 chuyên mục Từ vựng & Hán tự, 10 chuyên mục Đọc hiểu & JLPT, 10 chuyên mục Nghe nói & Phản xạ, 13 chuyên đề Doanh nghiệp Nhật - Việt, 30 chuyên đề Văn hóa & Tâm lý học, 10 phân hệ Đột phá N2-N1, 10 phân hệ Edutainment và 8 Trụ cột Bách Khoa Toàn Thư Nhật Bản (+10 chuyên đề mở rộng).",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
