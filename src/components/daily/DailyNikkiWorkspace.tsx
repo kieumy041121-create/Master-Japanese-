@@ -21,6 +21,7 @@ import {
   PenTool,
   Plus,
   Radio,
+  RotateCcw,
   Send,
   Sparkles,
   Square,
@@ -31,7 +32,6 @@ import {
 } from 'lucide-react';
 import {
   buildMonthlyMoodMap,
-  enrichStreamedNikkiEntry,
   evaluateSelfWrittenNikkiEntry,
   formatJapaneseDateLabel,
   GLASS_JAR_PROMPTS,
@@ -43,8 +43,9 @@ import {
   NikkiVocabTreasure,
   nikkiHistoryService,
   RedPenCorrection,
-  streamEmpathicNikkiTranslation,
+  streamCompleteEmpathicNikki,
 } from '../../services/dailyNikkiEngine';
+import { containsJapaneseChars } from '../../utils/nikkiResilience';
 import { speechService } from '../../services/speechService';
 import { srsVaultService } from '../../services/srsVaultService';
 import { zenAudioRadio, ZenAmbienceType } from '../../services/zenAudioRadio';
@@ -188,15 +189,18 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
     () => nikkiHistoryService.getAll()[0]?.id || ''
   );
 
-  // Composer state
+  // Composer state (starts clean so user can pour their own thoughts immediately)
   const [inputMode, setInputMode] = useState<NikkiInputMode>('translate');
-  const [composerText, setComposerText] = useState<string>(
-    'Hôm nay trời mưa to, tự nhiên thấy buồn ngang, chả muốn làm gì cả.'
-  );
+  const [composerText, setComposerText] = useState<string>('');
   const [styleMode, setStyleMode] = useState<NikkiStyleMode>('monologue');
   const [showFurigana, setShowFurigana] = useState<boolean>(true);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [failedSubmission, setFailedSubmission] = useState<{
+    text: string;
+    mode: NikkiInputMode;
+    error: string;
+  } | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [srsVersion, setSrsVersion] = useState<number>(0);
 
@@ -270,11 +274,7 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
     if (nextMode === inputMode) return;
     setInputMode(nextMode);
     setErrorMsg(null);
-    if (nextMode === 'self_write' && composerText === QUICK_TRANSLATE_PROMPTS[0].text) {
-      setComposerText(QUICK_SELF_WRITE_PROMPTS[0].text);
-    } else if (nextMode === 'translate' && composerText === QUICK_SELF_WRITE_PROMPTS[0].text) {
-      setComposerText(QUICK_TRANSLATE_PROMPTS[0].text);
-    }
+    setFailedSubmission(null);
   };
 
   const handleDrawGlassJarPrompt = () => {
@@ -298,11 +298,12 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
     showToast(`Đã chèn cụm「${expression}」vào khung viết.`);
   };
 
-  const handleSubmitNikki = async () => {
+  const handleSubmitNikki = async (overrideMode?: NikkiInputMode) => {
+    const activeMode = overrideMode || inputMode;
     const trimmed = composerText.trim();
     if (!trimmed) {
       setErrorMsg(
-        inputMode === 'translate'
+        activeMode === 'translate'
           ? 'Hãy viết vài dòng cảm xúc tiếng Việt của bạn hôm nay trước nhé.'
           : 'Hãy thử viết vài câu tiếng Nhật để Sensei Bút Đỏ đồng hành cùng bạn.'
       );
@@ -311,10 +312,11 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
 
     const requestSeq = ++streamSeqRef.current;
     setErrorMsg(null);
+    setFailedSubmission(null);
     setIsGenerating(true);
 
-    if (inputMode === 'translate') {
-      // Stage A: Zero-Latency Live Stream Rendering directly with Furigana <ruby> tokens
+    if (activeMode === 'translate') {
+      // Single-pass Zero-Latency Live Stream Rendering + Omoiyari Metadata
       setStreamPreview({
         vietnameseRaw: trimmed,
         tokens: [],
@@ -325,16 +327,16 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
       });
 
       try {
-        const streamedResult = await streamEmpathicNikkiTranslation(
+        const completeEntry = await streamCompleteEmpathicNikki(
           trimmed,
           styleMode,
-          ({ tokens, plainText, audit }) => {
+          ({ phase, tokens, plainText, audit }) => {
             if (streamSeqRef.current !== requestSeq) return;
             setStreamPreview({
               vietnameseRaw: trimmed,
               tokens,
               plainText,
-              phase: 'streaming',
+              phase,
               totalKanji: audit.totalKanjiChars,
               coveredKanji: audit.coveredKanjiChars,
             });
@@ -343,46 +345,31 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
 
         if (streamSeqRef.current !== requestSeq) return;
 
-        // Immediately release interactive button while Stage B enriches Haiku, Omoiyari & Treasures
-        setIsGenerating(false);
-        setStreamPreview((prev) =>
-          prev
-            ? {
-                ...prev,
-                tokens: streamedResult.tokens,
-                plainText: streamedResult.plainText,
-                phase: 'enriching',
-                totalKanji: streamedResult.audit.totalKanjiChars,
-                coveredKanji: streamedResult.audit.coveredKanjiChars,
-              }
-            : null
-        );
-
-        const enriched = await enrichStreamedNikkiEntry(
-          trimmed,
-          streamedResult.plainText,
-          streamedResult.tokens,
-          styleMode
-        );
-        if (streamSeqRef.current !== requestSeq) return;
-
-        const nextList = nikkiHistoryService.saveEntry(enriched);
+        const nextList = nikkiHistoryService.saveEntry(completeEntry);
         setEntries(nextList);
-        setActiveEntryId(enriched.id);
+        setActiveEntryId(completeEntry.id);
         setStreamPreview(null);
         speechService.playSuccessSound();
         showToast(
-          `Đã hoàn tất chuyển ngữ tức thì · Khảm Furigana ${enriched.moodKanji.kanji} (${enriched.moodKanji.sinoVietnamese})`
+          `Đã chuyển ngữ trọn vẹn tâm sự · Nhãn cảm xúc ${completeEntry.moodKanji.kanji} (${completeEntry.moodKanji.sinoVietnamese})`
         );
       } catch (err: unknown) {
         if (streamSeqRef.current !== requestSeq) return;
         setStreamPreview(null);
-        setIsGenerating(false);
         const msg =
           err instanceof Error
             ? err.message
             : 'Không thể kết nối AI lúc này. Vui lòng thử lại sau giây lát.';
         setErrorMsg(msg);
+        setFailedSubmission({
+          text: trimmed,
+          mode: 'translate',
+          error: msg,
+        });
+      } finally {
+        if (streamSeqRef.current === requestSeq) {
+          setIsGenerating(false);
+        }
       }
       return;
     }
@@ -397,13 +384,21 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
       speechService.playSuccessSound();
       showToast('Sensei đã chấm Bút Đỏ dịu dàng & gửi hồi đáp Omoiyari!');
     } catch (err: unknown) {
+      if (streamSeqRef.current !== requestSeq) return;
       const msg =
         err instanceof Error
           ? err.message
           : 'Không thể kết nối AI lúc này. Vui lòng thử lại sau giây lát.';
       setErrorMsg(msg);
+      setFailedSubmission({
+        text: trimmed,
+        mode: 'self_write',
+        error: msg,
+      });
     } finally {
-      setIsGenerating(false);
+      if (streamSeqRef.current === requestSeq) {
+        setIsGenerating(false);
+      }
     }
   };
 
@@ -894,14 +889,55 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
                       : 'bg-[#070b14] border-slate-800 text-slate-100 placeholder:text-slate-500 focus:ring-indigo-500/40'
                   }`}
                 />
-                <div className={`flex items-center justify-between text-xs ${mutedTextClass}`}>
-                  <span className="tabular-nums">{composerText.trim().length} ký tự</span>
-                  <span>
+                <div className={`flex items-center justify-between gap-2 text-xs ${mutedTextClass}`}>
+                  <div className="flex items-center gap-2.5">
+                    <span className="tabular-nums">{composerText.trim().length} ký tự</span>
+                    {composerText.trim().length > 0 && !isGenerating && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setComposerText('');
+                          setErrorMsg(null);
+                          setFailedSubmission(null);
+                        }}
+                        className="underline underline-offset-2 hover:opacity-100 opacity-80 cursor-pointer whitespace-nowrap"
+                      >
+                        Xóa viết mới
+                      </button>
+                    )}
+                  </div>
+                  <span className="truncate">
                     {inputMode === 'translate'
                       ? 'Enter để dịch dòng chảy · Shift+Enter xuống dòng'
                       : 'Enter để gửi Bút Đỏ · Shift+Enter xuống dòng'}
                   </span>
                 </div>
+
+                {/* Gentle auto-detect banner when user types pure Vietnamese in Self-Write mode */}
+                {inputMode === 'self_write' &&
+                  composerText.trim().length >= 8 &&
+                  !containsJapaneseChars(composerText) && (
+                    <div
+                      className={`rounded-xl border px-3 py-2 text-xs flex flex-wrap items-center justify-between gap-2 ${
+                        isSepia
+                          ? 'bg-amber-50 border-amber-300 text-amber-950'
+                          : 'bg-amber-950/30 border-amber-500/40 text-amber-200'
+                      }`}
+                    >
+                      <span>Bạn đang viết bằng tiếng Việt — muốn dịch sang tiếng Nhật tự động?</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setInputMode('translate');
+                          handleSubmitNikki('translate');
+                        }}
+                        disabled={isGenerating}
+                        className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold cursor-pointer whitespace-nowrap shrink-0 ${accentBtnClass}`}
+                      >
+                        Chuyển sang Dịch tự động
+                      </button>
+                    </div>
+                  )}
               </div>
 
               {/* Style Mode Selector */}
@@ -952,7 +988,7 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
 
               <button
                 type="button"
-                onClick={handleSubmitNikki}
+                onClick={() => handleSubmitNikki()}
                 disabled={isGenerating}
                 className={`w-full py-3 px-5 rounded-xl border text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-75 whitespace-nowrap shrink-0 ${accentBtnClass}`}
               >
@@ -1042,13 +1078,61 @@ export const DailyNikkiWorkspace: React.FC<DailyNikkiWorkspaceProps> = ({
 
                 <div className={`flex flex-wrap items-center justify-between gap-2 text-xs ${mutedTextClass}`}>
                   <span>
-                    Bản gốc: “{streamPreview.vietnameseRaw}”
+                    Tâm sự của bạn: “{streamPreview.vietnameseRaw}”
                   </span>
                   {streamPreview.totalKanji > 0 && (
                     <span className="font-mono tabular-nums">
                       Furigana phủ {streamPreview.coveredKanji}/{streamPreview.totalKanji} chữ Hán
                     </span>
                   )}
+                </div>
+              </div>
+            ) : failedSubmission ? (
+              <div className="space-y-5 my-auto py-4">
+                <div
+                  className={`rounded-2xl border p-5 sm:p-6 space-y-4 ${
+                    isSepia
+                      ? 'bg-rose-50/90 border-rose-300 text-rose-950'
+                      : 'bg-rose-950/25 border-rose-500/40 text-rose-100'
+                  }`}
+                >
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />
+                    <div className="space-y-1.5 min-w-0">
+                      <h3 className={`text-base font-bold ${headingTextClass}`}>
+                        Chưa thể chuyển ngữ tâm sự này ngay lúc này
+                      </h3>
+                      <p className="text-xs sm:text-sm leading-relaxed">
+                        {failedSubmission.error}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className={`rounded-xl border p-3.5 text-xs leading-relaxed ${subSurfaceClass} ${bodyTextClass}`}>
+                    <div className={`text-[11px] font-mono mb-1 ${mutedTextClass}`}>
+                      Nội dung bạn vừa viết (vẫn được giữ nguyên an toàn):
+                    </div>
+                    “{failedSubmission.text}”
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => handleSubmitNikki(failedSubmission.mode)}
+                      disabled={isGenerating}
+                      className={`px-4 py-2 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${accentBtnClass}`}
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Thử lại ngay</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFailedSubmission(null)}
+                      className={`px-3.5 py-2 rounded-xl border text-xs font-medium cursor-pointer whitespace-nowrap shrink-0 ${ghostBtnClass}`}
+                    >
+                      Xem lại trang nhật ký trước
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : activeEntry ? (

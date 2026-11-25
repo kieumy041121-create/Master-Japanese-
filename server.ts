@@ -9,6 +9,12 @@ import {
   sanitizeAndParseKissatenReply,
   sanitizeConversationHistory,
 } from './src/utils/kissatenResilience';
+import {
+  buildNikkiSelfWritePrompts,
+  buildNikkiTranslatePrompts,
+  classifyGeminiApiError,
+  NikkiStyleId,
+} from './src/utils/nikkiResilience';
 
 dotenv.config();
 
@@ -111,6 +117,15 @@ app.post('/api/gemini/generate', async (req: Request, res: Response) => {
       } catch (err: any) {
         lastError = err;
         const errMsg = err?.message || String(err);
+        const isAuth =
+          err?.status === 403 ||
+          errMsg.includes('PERMISSION_DENIED') ||
+          errMsg.includes('API_KEY_INVALID');
+
+        if (isAuth) {
+          break;
+        }
+
         const isQuota =
           err?.status === 429 ||
           errMsg.includes('429') ||
@@ -118,8 +133,8 @@ app.post('/api/gemini/generate', async (req: Request, res: Response) => {
           errMsg.includes('Quota exceeded');
 
         if (isQuota) {
-          console.info(`Gemini quota limit reached on ${modelName}, proceeding to next candidate or procedural data.`);
-          break;
+          console.info(`[Gemini] Quota limit reached on ${modelName}, falling back to next candidate model...`);
+          continue;
         }
 
         // If tools like googleSearch timed out or encountered issues, retry without tools
@@ -153,21 +168,11 @@ app.post('/api/gemini/generate', async (req: Request, res: Response) => {
     }
 
     if (!responseText) {
-      const isQuota =
-        lastError?.status === 429 ||
-        lastError?.message?.includes('429') ||
-        lastError?.message?.includes('RESOURCE_EXHAUSTED');
-
-      if (isQuota) {
-        return res.status(429).json({
-          error: 'Hạn mức Gemini Free Tier tạm thời hết trong ngày. Đang dùng tri thức nội bộ.',
-          quotaExceeded: true,
-          text: '',
-        });
-      }
-
-      return res.status(503).json({
-        error: lastError?.message || 'Dịch vụ AI đang bận',
+      const classified = classifyGeminiApiError(lastError);
+      return res.status(classified.httpStatus).json({
+        code: classified.code,
+        error: classified.messageVi,
+        quotaExceeded: classified.code === 'QUOTA_EXCEEDED',
         text: '',
       });
     }
@@ -323,11 +328,12 @@ app.post('/api/kissaten/chat', async (req: Request, res: Response) => {
           }
         }
 
-        if (status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
-          break;
-        }
         if (status === 403 || msg.includes('PERMISSION_DENIED') || msg.includes('API_KEY_INVALID')) {
           break;
+        }
+        // On 429 per-model quota, continue to try the next candidate model bucket
+        if (status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+          continue;
         }
       }
     }
@@ -387,21 +393,21 @@ app.post('/api/kissaten/chat', async (req: Request, res: Response) => {
 // Zero-Latency SSE Streaming endpoint for real-time AI Sensei token output
 app.post('/api/gemini/stream', async (req: Request, res: Response) => {
   try {
-    const { prompt, systemInstruction, fastMode = true } = req.body;
+    const { prompt, systemInstruction } = req.body;
 
     if (!process.env.GEMINI_API_KEY) {
       return res.status(500).json({
+        code: 'MISSING_API_KEY',
         error: 'Chưa cấu hình GEMINI_API_KEY. Vui lòng kiểm tra Settings > Secrets.',
       });
     }
 
     if (!prompt || typeof prompt !== 'string') {
-      return res.status(400).json({ error: 'Thiếu nội dung prompt.' });
+      return res.status(400).json({ code: 'EMPTY_PROMPT', error: 'Thiếu nội dung prompt.' });
     }
 
-    const candidateModels = fastMode
-      ? ['gemini-3.1-flash-lite', 'gemini-4-hydrogen']
-      : ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+    // Prioritize gemini-4-hydrogen (with ThinkingLevel.LOW) for fidelity + speed, fallback to gemini-3.1-flash-lite
+    const candidateModels = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
     let streamStarted = false;
     let lastError: any = null;
 
@@ -415,11 +421,16 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
           config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
         }
 
-        const streamResponse = await ai.models.generateContentStream({
-          model: modelName,
-          contents: prompt,
-          config,
-        });
+        const streamResponse = await Promise.race([
+          ai.models.generateContentStream({
+            model: modelName,
+            contents: prompt,
+            config,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`Timeout connecting stream on ${modelName}`)), 22000)
+          ),
+        ]);
 
         for await (const chunk of streamResponse) {
           const chunkText = chunk?.text;
@@ -437,36 +448,347 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
         }
 
         if (streamStarted) {
-          res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+          res.write(`data: ${JSON.stringify({ done: true, modelUsed: modelName })}\n\n`);
           res.end();
           return;
         }
       } catch (err: any) {
         lastError = err;
         if (streamStarted) {
-          res.write(`data: ${JSON.stringify({ done: true, error: err?.message || 'Stream interrupted' })}\n\n`);
+          const classified = classifyGeminiApiError(err);
+          res.write(`data: ${JSON.stringify({ done: true, error: classified.messageVi, code: classified.code })}\n\n`);
           res.end();
           return;
         }
         const errMsg = err?.message || String(err);
-        if (err?.status === 429 || errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED')) {
+        if (err?.status === 403 || errMsg.includes('PERMISSION_DENIED') || errMsg.includes('API_KEY_INVALID')) {
           break;
         }
+        console.info(`[Gemini Stream] ${modelName} fallback:`, errMsg.slice(0, 120));
       }
     }
 
     if (!res.headersSent) {
-      return res.status(503).json({
-        error: lastError?.message || 'Dịch vụ AI Stream tạm thời bận',
+      const classified = classifyGeminiApiError(lastError);
+      return res.status(classified.httpStatus).json({
+        code: classified.code,
+        error: classified.messageVi,
       });
     }
   } catch (error: any) {
     if (!res.headersSent) {
-      return res.status(500).json({
-        error: error?.message || 'Lỗi kết nối stream',
+      const classified = classifyGeminiApiError(error);
+      return res.status(classified.httpStatus).json({
+        code: classified.code,
+        error: classified.messageVi,
       });
     }
     res.end();
+  }
+});
+
+// Dedicated Single-Pass Streaming Endpoint for Daily Nikki (日記) Empathic Translation
+app.post('/api/nikki/stream', async (req: Request, res: Response) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({
+        code: 'MISSING_API_KEY',
+        error: 'Chưa cấu hình GEMINI_API_KEY. Vui lòng kiểm tra Settings > Secrets.',
+      });
+    }
+
+    const vietnameseText = typeof req.body?.vietnameseText === 'string' ? req.body.vietnameseText.trim() : '';
+    const rawStyle = typeof req.body?.styleMode === 'string' ? req.body.styleMode : 'monologue';
+    const styleMode: NikkiStyleId =
+      rawStyle === 'poetic' || rawStyle === 'futsukei' ? rawStyle : 'monologue';
+    const allowedMoods =
+      typeof req.body?.allowedMoods === 'string' && req.body.allowedMoods.trim()
+        ? req.body.allowedMoods.trim()
+        : '喜, 楽, 希, 平, 静, 穏, 感, 哀, 悲, 疲, 怒, 焦';
+
+    if (!vietnameseText) {
+      return res.status(400).json({
+        code: 'EMPTY_INPUT',
+        error: 'Hãy viết đôi dòng tâm sự của bạn trước khi chuyển ngữ nhé.',
+      });
+    }
+
+    const { systemInstruction, prompt } = buildNikkiTranslatePrompts(
+      vietnameseText,
+      styleMode,
+      allowedMoods
+    );
+
+    const candidateModels = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+    let streamStarted = false;
+    let lastError: any = null;
+
+    for (const modelName of candidateModels) {
+      try {
+        const config: any = {
+          systemInstruction,
+        };
+        if (modelName === 'gemini-4-hydrogen') {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        }
+
+        const streamResponse = await Promise.race([
+          ai.models.generateContentStream({
+            model: modelName,
+            contents: prompt,
+            config,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`Timeout on ${modelName}`)), 24000)
+          ),
+        ]);
+
+        for await (const chunk of streamResponse) {
+          const chunkText = chunk?.text;
+          if (chunkText) {
+            if (!streamStarted) {
+              streamStarted = true;
+              res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+              res.setHeader('Cache-Control', 'no-cache, no-transform');
+              res.setHeader('Connection', 'keep-alive');
+              res.setHeader('X-Accel-Buffering', 'no');
+              res.flushHeaders?.();
+            }
+            res.write(`data: ${JSON.stringify({ chunk: chunkText })}\n\n`);
+          }
+        }
+
+        if (streamStarted) {
+          res.write(`data: ${JSON.stringify({ done: true, modelUsed: modelName })}\n\n`);
+          res.end();
+          return;
+        }
+      } catch (err: any) {
+        lastError = err;
+        if (streamStarted) {
+          const classified = classifyGeminiApiError(err);
+          res.write(`data: ${JSON.stringify({ done: true, error: classified.messageVi, code: classified.code })}\n\n`);
+          res.end();
+          return;
+        }
+        const errMsg = err?.message || String(err);
+        if (err?.status === 403 || errMsg.includes('PERMISSION_DENIED') || errMsg.includes('API_KEY_INVALID')) {
+          break;
+        }
+        console.info(`[Nikki Stream] ${modelName} fallback:`, errMsg.slice(0, 120));
+      }
+    }
+
+    if (!res.headersSent) {
+      const classified = classifyGeminiApiError(lastError);
+      return res.status(classified.httpStatus).json({
+        code: classified.code,
+        error: classified.messageVi,
+      });
+    }
+  } catch (error: any) {
+    if (!res.headersSent) {
+      const classified = classifyGeminiApiError(error);
+      return res.status(classified.httpStatus).json({
+        code: classified.code,
+        error: classified.messageVi,
+      });
+    }
+    res.end();
+  }
+});
+
+// Dedicated Resilient Endpoint for Daily Nikki Self-Write Red Pen (Bút Đỏ) Mode
+app.post('/api/nikki/self-write', async (req: Request, res: Response) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({
+        code: 'MISSING_API_KEY',
+        error: 'Chưa cấu hình GEMINI_API_KEY. Vui lòng kiểm tra Settings > Secrets.',
+      });
+    }
+
+    const rawJapaneseText = typeof req.body?.japaneseText === 'string' ? req.body.japaneseText.trim() : '';
+    const rawStyle = typeof req.body?.styleMode === 'string' ? req.body.styleMode : 'monologue';
+    const styleMode: NikkiStyleId =
+      rawStyle === 'poetic' || rawStyle === 'futsukei' ? rawStyle : 'monologue';
+    const allowedMoods =
+      typeof req.body?.allowedMoods === 'string' && req.body.allowedMoods.trim()
+        ? req.body.allowedMoods.trim()
+        : '喜, 楽, 希, 平, 静, 穏, 感, 哀, 悲, 疲, 怒, 焦';
+
+    if (!rawJapaneseText) {
+      return res.status(400).json({
+        code: 'EMPTY_INPUT',
+        error: 'Hãy viết vài câu tiếng Nhật trước khi gửi Sensei Bút Đỏ nhé.',
+      });
+    }
+
+    const { systemInstruction, prompt } = buildNikkiSelfWritePrompts(
+      rawJapaneseText,
+      styleMode,
+      allowedMoods
+    );
+
+    const selfWriteSchema = {
+      type: Type.OBJECT,
+      properties: {
+        emotionalTone: { type: Type.STRING },
+        moodKanjiChar: { type: Type.STRING },
+        japaneseTitle: { type: Type.STRING },
+        japanesePlain: { type: Type.STRING },
+        japaneseFurigana: { type: Type.STRING },
+        vietnameseMeaning: { type: Type.STRING },
+        praiseFirst: { type: Type.STRING },
+        redPenCorrections: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              original: { type: Type.STRING },
+              corrected: { type: Type.STRING },
+              category: { type: Type.STRING },
+              gentleReason: { type: Type.STRING },
+            },
+            required: ['original', 'corrected', 'gentleReason'],
+          },
+        },
+        haikuLines: { type: Type.ARRAY, items: { type: Type.STRING } },
+        haikuVietnamese: { type: Type.STRING },
+        bestQuoteJa: { type: Type.STRING },
+        bestQuoteVi: { type: Type.STRING },
+        therapistReply: {
+          type: Type.OBJECT,
+          properties: {
+            japanese: { type: Type.STRING },
+            reading: { type: Type.STRING },
+            vietnamese: { type: Type.STRING },
+            cultureNote: { type: Type.STRING },
+          },
+          required: ['japanese', 'reading', 'vietnamese', 'cultureNote'],
+        },
+        treasures: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              expression: { type: Type.STRING },
+              furigana: { type: Type.STRING },
+              romaji: { type: Type.STRING },
+              pitchType: { type: Type.STRING },
+              pitchAccentNum: { type: Type.INTEGER },
+              pitchLabel: { type: Type.STRING },
+              meaning: { type: Type.STRING },
+              whyLearn: { type: Type.STRING },
+              jlpt: { type: Type.STRING },
+              contextSentence: { type: Type.STRING },
+            },
+            required: ['expression', 'furigana', 'romaji', 'pitchLabel', 'meaning', 'whyLearn'],
+          },
+        },
+      },
+      required: [
+        'emotionalTone',
+        'moodKanjiChar',
+        'japaneseTitle',
+        'japanesePlain',
+        'japaneseFurigana',
+        'vietnameseMeaning',
+        'praiseFirst',
+        'therapistReply',
+      ],
+    };
+
+    const candidateModels = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+    let lastError: any = null;
+    let rawOutput = '';
+    let modelUsed = '';
+
+    for (const modelName of candidateModels) {
+      try {
+        const modelConfig: any = {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: selfWriteSchema,
+        };
+        if (modelName === 'gemini-4-hydrogen') {
+          modelConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        }
+
+        const response: any = await Promise.race([
+          ai.models.generateContent({
+            model: modelName,
+            contents: prompt,
+            config: modelConfig,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`Timeout on ${modelName}`)), 26000)
+          ),
+        ]);
+
+        if (response && typeof response.text === 'string' && response.text.trim()) {
+          rawOutput = response.text;
+          modelUsed = modelName;
+          break;
+        }
+      } catch (err: any) {
+        lastError = err;
+        const msg = err?.message || String(err);
+        const status = err?.status || err?.code;
+
+        if (status === 400 && !msg.includes('API_KEY')) {
+          try {
+            const looseResponse: any = await Promise.race([
+              ai.models.generateContent({
+                model: modelName,
+                contents: prompt,
+                config: {
+                  systemInstruction,
+                  ...(modelName === 'gemini-4-hydrogen'
+                    ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                    : {}),
+                },
+              }),
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error(`Loose timeout on ${modelName}`)), 24000)
+              ),
+            ]);
+            if (looseResponse && typeof looseResponse.text === 'string' && looseResponse.text.trim()) {
+              rawOutput = looseResponse.text;
+              modelUsed = `${modelName}-loose`;
+              break;
+            }
+          } catch (looseErr: any) {
+            lastError = looseErr;
+          }
+        }
+
+        if (status === 403 || msg.includes('PERMISSION_DENIED') || msg.includes('API_KEY_INVALID')) {
+          break;
+        }
+        console.info(`[Nikki Self-Write] ${modelName} fallback:`, msg.slice(0, 120));
+      }
+    }
+
+    if (!rawOutput) {
+      const classified = classifyGeminiApiError(lastError);
+      return res.status(classified.httpStatus).json({
+        code: classified.code,
+        error: classified.messageVi,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      modelUsed,
+      text: rawOutput,
+    });
+  } catch (error: any) {
+    const classified = classifyGeminiApiError(error);
+    return res.status(classified.httpStatus).json({
+      code: classified.code,
+      error: classified.messageVi,
+    });
   }
 });
 

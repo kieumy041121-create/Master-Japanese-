@@ -1,5 +1,12 @@
 import { callGemini, callGeminiStream, safeExtractJson } from './geminiService';
 import { JLPTLevel } from '../types';
+import {
+  containsJapaneseChars,
+  normalizeAlternativeFuriganaSyntax,
+  parseNikkiMetaJson,
+  splitNikkiStreamOutput,
+  stripInlineFurigana,
+} from '../utils/nikkiResilience';
 
 export type NikkiStyleMode = 'monologue' | 'futsukei' | 'poetic';
 export type NikkiInputMode = 'translate' | 'self_write';
@@ -1676,43 +1683,88 @@ export async function evaluateSelfWrittenNikkiEntry(
   }
 
   const allowedMoods = MOOD_KANJI_PALETTE.map((m) => `${m.kanji} (${m.meaningVi})`).join(', ');
+  let lastError: Error | null = null;
 
-  const systemInstruction = `Bạn là Sensei "Bút Đỏ Chữa Lành" (Red Pen & Ego-Preservation Mentor), thi sĩ Haiku và người bạn tri kỷ bản xứ.
-Người học đã dũng cảm tự viết nhật ký bằng tiếng Nhật.
-Nhiệm vụ tối cao:
-1. Bảo toàn lòng tự trọng ("praiseFirst"): Viết 1 câu khen chân thành điểm làm tốt trong đoạn tiếng Nhật của người học.
-2. Soi Bút Đỏ tinh tế ("redPenCorrections"): Tìm 2-4 điểm cần chỉnh sửa hoặc nâng tầm lên văn phong Native Flow ("original", "corrected", "category", "gentleReason").
-3. Viết bản hoàn thiện mượt mà nhất vào "japanesePlain" theo phong cách: ${buildStyleGuidance(styleMode)}.
-4. Dịch lại ý nghĩa tiếng Việt trọn vẹn vào "vietnameseMeaning".
-5. Gắn "moodKanjiChar" là 1 chữ Hán đại diện cảm xúc từ: ${allowedMoods}.
-6. Sáng tác 1 bài Haiku 3 dòng ("haikuLines" + "haikuVietnamese") và trích 1 Quote đắt giá nhất ("bestQuoteJa" + "bestQuoteVi").
-7. Tạo "therapistReply" (Omoiyari) + "tokens" khớp 100% "japanesePlain" + 3-4 "treasures".`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 56000);
+    try {
+      const res = await fetch('/api/nikki/self-write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          japaneseText: cleanedJa,
+          styleMode,
+          allowedMoods,
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
 
-  const prompt = `Hãy soi Bút Đỏ tinh tế, nâng cấp sang văn phong bản xứ, sáng tác Haiku và hồi đáp chữa lành cho bài nhật ký tiếng Nhật do người học tự viết sau:
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg =
+          typeof data?.error === 'string' && data.error.trim()
+            ? data.error.trim()
+            : `Máy chủ AI tạm thời gặp sự cố (${res.status}). Vui lòng thử lại.`;
+        const retryable = res.status === 503 || res.status === 504;
+        lastError = new Error(msg);
+        if (retryable && attempt === 0) {
+          await new Promise((r) => setTimeout(r, 900));
+          continue;
+        }
+        throw lastError;
+      }
 
-"""
-${cleanedJa}
-"""
+      const rawText = typeof data?.text === 'string' ? data.text : '';
+      const parsed = parseNikkiMetaJson<
+        RawGeminiNikkiPayload & { japaneseFurigana?: string }
+      >(rawText);
 
-Chỉ trả về JSON hợp lệ theo schema.`;
+      const furiganaSrc = typeof parsed.japaneseFurigana === 'string' ? parsed.japaneseFurigana : '';
+      const parsedFromFurigana = furiganaSrc ? parseInlineFuriganaStream(furiganaSrc) : null;
+      const cleanPlain =
+        stripInlineFurigana(parsed.japanesePlain || '') ||
+        parsedFromFurigana?.plainText ||
+        cleanedJa;
 
-  const rawText = await callGemini(
-    prompt,
-    systemInstruction,
-    undefined,
-    false,
-    NIKKI_RESPONSE_SCHEMA,
-    false
-  );
+      const normalizedPayload: RawGeminiNikkiPayload = {
+        ...parsed,
+        japanesePlain: cleanPlain,
+        japaneseTitle: stripInlineFurigana(parsed.japaneseTitle || '') || '今日のひとこと',
+        bestQuoteJa: stripInlineFurigana(parsed.bestQuoteJa || '') || undefined,
+        tokens:
+          parsedFromFurigana && parsedFromFurigana.tokens.length > 0
+            ? parsedFromFurigana.tokens
+            : parsed.tokens,
+      };
 
-  const parsed = safeExtractJson<RawGeminiNikkiPayload>(rawText, {});
-  return hydrateParsedPayload(
-    parsed,
-    'self_write',
-    parsed.vietnameseMeaning || cleanedJa,
-    styleMode,
-    cleanedJa
-  );
+      return hydrateParsedPayload(
+        normalizedPayload,
+        'self_write',
+        parsed.vietnameseMeaning || cleanedJa,
+        styleMode,
+        cleanedJa
+      );
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      const isAbort = err?.name === 'AbortError';
+      const errObj = isAbort
+        ? new Error('Kết nối tới máy chủ AI quá thời gian chờ. Nội dung của bạn vẫn được giữ nguyên — hãy bấm Thử lại nhé.')
+        : err instanceof Error
+        ? err
+        : new Error('Không thể kết nối AI lúc này. Vui lòng thử lại sau giây lát.');
+
+      lastError = errObj;
+      if (isAbort && attempt === 0) {
+        await new Promise((r) => setTimeout(r, 900));
+        continue;
+      }
+      throw errObj;
+    }
+  }
+
+  throw lastError || new Error('Không thể chấm Bút Đỏ lúc này. Vui lòng thử lại.');
 }
 
 // ============================================================================
@@ -2145,10 +2197,7 @@ export function parseInlineFuriganaStream(rawStreamText: string): {
   plainText: string;
   audit: TranslationFuriganaAudit;
 } {
-  let cleaned = rawStreamText
-    .replace(/```[a-z]*\n?/gi, '')
-    .replace(/```/g, '')
-    .trimStart();
+  let cleaned = normalizeAlternativeFuriganaSyntax(rawStreamText);
 
   // Safely strip unfinished trailing {kanji|kana marker during live stream
   const lastOpen = cleaned.lastIndexOf('{');
@@ -2190,6 +2239,169 @@ export function parseInlineFuriganaStream(rawStreamText: string): {
     plainText: audit.plainText,
     audit,
   };
+}
+
+/**
+ * Single-pass Zero-Latency streaming translation + complete therapeutic Nikki entry.
+ * Makes ONLY 1 Gemini API call (halves latency & quota usage, eliminates drift between
+ * translation and Haiku/Mood/Therapist Reply/Treasures).
+ */
+export async function streamCompleteEmpathicNikki(
+  vietnameseText: string,
+  styleMode: NikkiStyleMode,
+  onProgress: (state: {
+    phase: 'streaming' | 'enriching';
+    tokens: NikkiToken[];
+    plainText: string;
+    audit: TranslationFuriganaAudit;
+  }) => void
+): Promise<NikkiEntryRecord> {
+  const cleaned = vietnameseText.trim();
+  if (!cleaned) {
+    throw new Error('Vui lòng nhập đôi dòng tâm sự của bạn trước khi chuyển ngữ.');
+  }
+
+  const allowedMoods = MOOD_KANJI_PALETTE.map((m) => `${m.kanji} (${m.meaningVi})`).join(', ');
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 54000);
+
+    try {
+      const res = await fetch('/api/nikki/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          vietnameseText: cleaned,
+          styleMode,
+          allowedMoods,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok || !res.body) {
+        clearTimeout(timeoutId);
+        const errBody = await res.json().catch(() => ({}));
+        const msg =
+          typeof errBody?.error === 'string' && errBody.error.trim()
+            ? errBody.error.trim()
+            : `Máy chủ AI tạm thời gặp sự cố (${res.status}). Vui lòng thử lại.`;
+        const retryable = res.status === 503 || res.status === 504;
+        lastError = new Error(msg);
+        if (retryable && attempt === 0) {
+          await new Promise((r) => setTimeout(r, 900));
+          continue;
+        }
+        throw lastError;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let fullAccumulated = '';
+      let streamErrorMsg = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith('data:')) continue;
+          const jsonStr = line.slice(5).trim();
+          if (!jsonStr) continue;
+          try {
+            const payload = JSON.parse(jsonStr);
+            if (payload.error) {
+              streamErrorMsg = String(payload.error);
+            }
+            if (payload.chunk) {
+              fullAccumulated += payload.chunk;
+              const split = splitNikkiStreamOutput(fullAccumulated);
+              const parsed = parseInlineFuriganaStream(split.translationRaw);
+              onProgress({
+                phase: split.hasDelimiter ? 'enriching' : 'streaming',
+                tokens: parsed.tokens,
+                plainText: parsed.plainText,
+                audit: parsed.audit,
+              });
+            }
+          } catch {
+            // Ignore partial SSE JSON frames
+          }
+        }
+      }
+
+      clearTimeout(timeoutId);
+
+      const finalSplit = splitNikkiStreamOutput(fullAccumulated);
+      const finalTranslation = parseInlineFuriganaStream(finalSplit.translationRaw);
+      const plainText = finalTranslation.plainText.trim();
+
+      if (!plainText || !containsJapaneseChars(plainText)) {
+        const errMessage =
+          streamErrorMsg ||
+          'AI chưa trả về bản dịch tiếng Nhật hoàn chỉnh cho tâm sự này. Hãy bấm Thử lại nhé.';
+        lastError = new Error(errMessage);
+        if (attempt === 0 && !streamErrorMsg.includes('429')) {
+          await new Promise((r) => setTimeout(r, 900));
+          continue;
+        }
+        throw lastError;
+      }
+
+      const metaParsed = parseNikkiMetaJson<RawGeminiNikkiPayload>(finalSplit.metaRaw);
+
+      const cleanedTreasures = Array.isArray(metaParsed.treasures)
+        ? metaParsed.treasures.map((tr) => ({
+            ...tr,
+            expression: stripInlineFurigana(tr.expression || ''),
+            contextSentence: stripInlineFurigana(tr.contextSentence || '') || plainText,
+          }))
+        : [];
+
+      const mergedPayload: RawGeminiNikkiPayload = {
+        ...metaParsed,
+        japanesePlain: plainText,
+        japaneseTitle: stripInlineFurigana(metaParsed.japaneseTitle || '') || '本日の日記',
+        bestQuoteJa: stripInlineFurigana(metaParsed.bestQuoteJa || '') || undefined,
+        vietnameseMeaning: cleaned,
+        tokens: finalTranslation.tokens,
+        treasures: cleanedTreasures,
+        auditNote:
+          'Đã chuyển ngữ trung thành 100% tâm sự gốc · Khảm Furigana tức thì & dệt hồi đáp Omoiyari.',
+      };
+
+      const record = hydrateParsedPayload(mergedPayload, 'translate', cleaned, styleMode);
+      // Strictly preserve the user's exact Vietnamese confession verbatim
+      record.vietnameseRaw = cleaned;
+      return record;
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      const isAbort = err?.name === 'AbortError';
+      const errObj = isAbort
+        ? new Error(
+            'Kết nối tới máy chủ AI quá thời gian chờ. Tâm sự của bạn vẫn còn nguyên — hãy bấm Thử lại nhé.'
+          )
+        : err instanceof Error
+        ? err
+        : new Error('Không thể kết nối AI lúc này. Vui lòng thử lại sau giây lát.');
+
+      lastError = errObj;
+      if (isAbort && attempt === 0) {
+        await new Promise((r) => setTimeout(r, 900));
+        continue;
+      }
+      throw errObj;
+    }
+  }
+
+  throw lastError || new Error('Không thể chuyển ngữ lúc này. Vui lòng thử lại.');
 }
 
 export async function streamEmpathicNikkiTranslation(
